@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/raw/
+data/output/
+*.log
+.vscode/
+.idea/
+.DS_Store
+data/yc-output/
