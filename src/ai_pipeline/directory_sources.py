@@ -20,6 +20,17 @@ LOGGER = logging.getLogger(__name__)
 
 
 class YCStartupCrawler:
+    """Collect YC company records.
+
+    Primary path: the public YC company index published at
+    https://yc-oss.github.io/api/companies/all.json which is updated regularly
+    and requires no authentication or JavaScript rendering.
+
+    Fallback path: if the public index is unavailable or returns fewer records
+    than requested, a headless Playwright session captures the Algolia search
+    response from https://www.ycombinator.com/companies.
+    """
+
     public_index_endpoint = "https://yc-oss.github.io/api/companies/all.json"
 
     def __init__(self, start_url: str = "https://www.ycombinator.com/companies"):
@@ -27,61 +38,115 @@ class YCStartupCrawler:
 
     async def crawl(self, limit: int = 1000) -> list[StartupRecord]:
         collected = datetime.now(timezone.utc)
+        # Primary: use the public JSON index (fast, reliable, no JS needed)
+        hits = await self._fetch_public_index()
+        if len(hits) < limit:
+            LOGGER.info(
+                "yc_public_index_insufficient count=%s limit=%s, trying playwright",
+                len(hits),
+                limit,
+            )
+            playwright_hits = await self._fetch_via_playwright()
+            if len(playwright_hits) > len(hits):
+                hits = playwright_hits
+        return self._hits_to_records(hits, limit, collected)
+
+    async def _fetch_public_index(self) -> list[dict]:
+        """Fetch the public YC company index JSON."""
+        fetcher = AsyncFetcher()
+        try:
+            async with aiohttp.ClientSession(
+                timeout=fetcher.timeout, connector=fetcher.connector()
+            ) as session:
+                raw = await fetcher.get(session, self.public_index_endpoint)
+            data = json.loads(raw)
+            if isinstance(data, list) and data:
+                LOGGER.info("yc_public_index_fetched count=%s", len(data))
+                return data
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as error:
+            LOGGER.warning("yc_public_index_failed error=%s", error)
+        return []
+
+    async def _fetch_via_playwright(self) -> list[dict]:
+        """Render the YC companies page with Playwright and capture Algolia hits."""
         response_objects = []
         search_request: dict[str, str] = {}
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            page = await browser.new_page()
+        try:
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(headless=True)
+                page = await browser.new_page()
 
-            def capture(response) -> None:
-                if "algolia.net/1/indexes" not in response.url:
-                    return
-                response_objects.append(response)
+                def capture(response) -> None:
+                    if "algolia.net/1/indexes" not in response.url:
+                        return
+                    response_objects.append(response)
 
-            def capture_request(request) -> None:
-                if "algolia.net/1/indexes" in request.url and request.method == "POST" and request.post_data:
-                    search_request["url"] = request.url
-                    search_request["body"] = request.post_data
+                def capture_request(request) -> None:
+                    if (
+                        "algolia.net/1/indexes" in request.url
+                        and request.method == "POST"
+                        and request.post_data
+                    ):
+                        search_request["url"] = request.url
+                        search_request["body"] = request.post_data
 
-            page.on("response", capture)
-            page.on("request", capture_request)
-            await page.goto(self.start_url, wait_until="networkidle", timeout=60000)
-            await page.wait_for_timeout(1000)
-            responses = []
-            if search_request:
-                try:
-                    responses.append(await page.evaluate("""async ({url, body}) => {
-                        const response = await fetch(url, {method: 'POST', headers: {'content-type': 'application/json'}, body});
-                        if (!response.ok) throw new Error(`YC search HTTP ${response.status}`);
-                        return response.json();
-                    }""", search_request))
-                except Exception as error:
-                    LOGGER.warning("yc_search_request_failed error=%s", error)
-            for response in response_objects:
-                try:
-                    payload = await response.json()
-                    if payload.get("results", [{}])[0].get("hits", []):
-                        responses.append(payload)
-                except Exception:
-                    continue
-            if not responses:
-                dom_links = await page.locator('a[href*="/companies/"]').evaluate_all("links => links.map(link => ({name: link.innerText.trim(), url: link.href}))")
-                dom_hits = [
-                    {"name": item["name"].split("\n", 1)[0].strip(), "slug": item["url"].rstrip("/").split("/")[-1]}
-                    for item in dom_links
-                    if item.get("name") and item.get("url")
-                ]
-                responses = [{"results": [{"hits": dom_hits}]}]
-            await browser.close()
-        hits = max((payload.get("results", [{}])[0].get("hits", []) for payload in responses), key=len, default=[])
-        if not hits:
-            fetcher = AsyncFetcher()
-            try:
-                async with aiohttp.ClientSession(timeout=fetcher.timeout, connector=fetcher.connector()) as session:
-                    public_index = json.loads(await fetcher.get(session, self.public_index_endpoint))
-                hits = public_index if isinstance(public_index, list) else []
-            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as error:
-                LOGGER.warning("yc_public_index_failed error=%s", error)
+                page.on("response", capture)
+                page.on("request", capture_request)
+                await page.goto(self.start_url, wait_until="networkidle", timeout=60000)
+                await page.wait_for_timeout(1000)
+                responses = []
+                if search_request:
+                    try:
+                        responses.append(
+                            await page.evaluate(
+                                """async ({url, body}) => {
+                                const response = await fetch(url, {method: 'POST', headers: {'content-type': 'application/json'}, body});
+                                if (!response.ok) throw new Error(`YC search HTTP ${response.status}`);
+                                return response.json();
+                            }""",
+                                search_request,
+                            )
+                        )
+                    except Exception as error:
+                        LOGGER.warning("yc_search_request_failed error=%s", error)
+                for response in response_objects:
+                    try:
+                        payload = await response.json()
+                        if payload.get("results", [{}])[0].get("hits", []):
+                            responses.append(payload)
+                    except Exception:
+                        continue
+                if not responses:
+                    dom_links = await page.locator(
+                        'a[href*="/companies/"]'
+                    ).evaluate_all(
+                        "links => links.map(link => ({name: link.innerText.trim(), url: link.href}))"
+                    )
+                    dom_hits = [
+                        {
+                            "name": item["name"].split("\n", 1)[0].strip(),
+                            "slug": item["url"].rstrip("/").split("/")[-1],
+                        }
+                        for item in dom_links
+                        if item.get("name") and item.get("url")
+                    ]
+                    responses = [{"results": [{"hits": dom_hits}]}]
+                await browser.close()
+            return max(
+                (
+                    payload.get("results", [{}])[0].get("hits", [])
+                    for payload in responses
+                ),
+                key=len,
+                default=[],
+            )
+        except Exception as error:
+            LOGGER.warning("yc_playwright_failed error=%s", error)
+            return []
+
+    def _hits_to_records(
+        self, hits: list[dict], limit: int, collected: datetime
+    ) -> list[StartupRecord]:
         records: list[StartupRecord] = []
         seen: set[str] = set()
         for item in hits:
@@ -93,8 +158,23 @@ class YCStartupCrawler:
             if url in seen:
                 continue
             seen.add(url)
-            employee_count = item.get("team_size") if isinstance(item.get("team_size"), int) else None
-            records.append(StartupRecord(source=Source(name="Y Combinator Startup Directory", url=url, record_id=str(item.get("id")) if item.get("id") else None), collectedAt=collected, entityName=name, employeeCount=employee_count))
+            employee_count = (
+                item.get("team_size")
+                if isinstance(item.get("team_size"), int)
+                else None
+            )
+            records.append(
+                StartupRecord(
+                    source=Source(
+                        name="Y Combinator Startup Directory",
+                        url=url,
+                        record_id=str(item.get("id")) if item.get("id") else None,
+                    ),
+                    collectedAt=collected,
+                    entityName=name,
+                    employeeCount=employee_count,
+                )
+            )
             if len(records) >= limit:
                 break
         return records
@@ -114,7 +194,9 @@ class PublicDirectoryCrawler:
         seen_urls: set[str] = set()
         next_url: str | None = self.start_url
         fetcher = AsyncFetcher()
-        async with aiohttp.ClientSession(timeout=fetcher.timeout, connector=fetcher.connector()) as session:
+        async with aiohttp.ClientSession(
+            timeout=fetcher.timeout, connector=fetcher.connector()
+        ) as session:
             for _ in range(self.max_pages):
                 if not next_url or len(records) >= limit:
                     break
@@ -129,11 +211,18 @@ class PublicDirectoryCrawler:
                             if len(records) >= limit:
                                 break
                 except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-                    LOGGER.warning("directory_page_failed source=%s url=%s error=%s", self.source_name, next_url, error)
+                    LOGGER.warning(
+                        "directory_page_failed source=%s url=%s error=%s",
+                        self.source_name,
+                        next_url,
+                        error,
+                    )
                     break
         return records[:limit]
 
-    def _parse_page(self, html: str, page_url: str, seen_urls: set[str]) -> tuple[list[StartupRecord | ProductRecord], str | None]:
+    def _parse_page(
+        self, html: str, page_url: str, seen_urls: set[str]
+    ) -> tuple[list[StartupRecord | ProductRecord], str | None]:
         try:
             payload = json.loads(html)
         except json.JSONDecodeError:
@@ -142,31 +231,58 @@ class PublicDirectoryCrawler:
             return self._parse_json_api(payload, page_url, seen_urls)
         soup = BeautifulSoup(html, "html.parser")
         collected = datetime.now(timezone.utc)
-        records: list[StartupRecord | ProductRecord] = self._parse_json_ld(soup, page_url, collected, seen_urls)
+        records: list[StartupRecord | ProductRecord] = self._parse_json_ld(
+            soup, page_url, collected, seen_urls
+        )
         page_seen_urls = seen_urls | {str(record.source.url) for record in records}
         for link in soup.select("a[data-record-url], a.company-link, a.product-link"):
             href = link.get("data-record-url") or link.get("href")
             name = link.get_text(" ", strip=True)
             if not href or not name:
                 continue
-            source_url = urljoin(page_url, href)
+            source_url = urljoin(page_url, str(href))
             if source_url in page_seen_urls:
                 continue
             if self.kind == "startup":
-                employee_text = link.get("data-employee-count", "")
+                employee_text = str(link.get("data-employee-count") or "")
                 employee_count = int(employee_text) if employee_text.isdigit() else None
-                records.append(StartupRecord(source=Source(name=self.source_name, url=source_url), collectedAt=collected, entityName=name, employeeCount=employee_count))
+                records.append(
+                    StartupRecord(
+                        source=Source(name=self.source_name, url=source_url),
+                        collectedAt=collected,
+                        entityName=name,
+                        employeeCount=employee_count,
+                    )
+                )
             else:
                 pricing = link.get("data-pricing-model")
                 if pricing not in {"FREE", "FREEMIUM", "PAID", "ENTERPRISE"}:
                     pricing = None
-                records.append(ProductRecord(source=Source(name=self.source_name, url=source_url), collectedAt=collected, startupName=name, pricingModel=pricing))
+                records.append(
+                    ProductRecord(
+                        source=Source(name=self.source_name, url=source_url),
+                        collectedAt=collected,
+                        startupName=name,
+                        pricingModel=pricing,
+                    )
+                )
             page_seen_urls.add(source_url)
         next_link = soup.select_one("a[rel='next'], a.next-page")
-        return records, urljoin(page_url, next_link["href"]) if next_link and next_link.get("href") else None
+        return (
+            records,
+            urljoin(page_url, str(next_link["href"]))
+            if next_link and next_link.get("href")
+            else None,
+        )
 
-    def _parse_json_api(self, payload: object, page_url: str, seen_urls: set[str]) -> tuple[list[StartupRecord | ProductRecord], str | None]:
-        items = payload.get("data", payload.get("items", [])) if isinstance(payload, dict) else payload
+    def _parse_json_api(
+        self, payload: object, page_url: str, seen_urls: set[str]
+    ) -> tuple[list[StartupRecord | ProductRecord], str | None]:
+        items = (
+            payload.get("data", payload.get("items", []))
+            if isinstance(payload, dict)
+            else payload
+        )
         if not isinstance(items, list):
             return [], None
         collected = datetime.now(timezone.utc)
@@ -174,7 +290,11 @@ class PublicDirectoryCrawler:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            name = item.get("name") or item.get("company_name") or item.get("companyName")
+            name = (
+                item.get("name")
+                or item.get("company_name")
+                or item.get("companyName")
+            )
             href = item.get("url") or item.get("website") or item.get("company_url")
             if not name or not href:
                 continue
@@ -183,23 +303,56 @@ class PublicDirectoryCrawler:
                 continue
             if self.kind == "startup":
                 employee_count = item.get("employee_count", item.get("team_size"))
-                employee_count = int(employee_count) if isinstance(employee_count, int) or str(employee_count).isdigit() else None
-                records.append(StartupRecord(source=Source(name=self.source_name, url=source_url), collectedAt=collected, entityName=str(name), employeeCount=employee_count))
+                employee_count = (
+                    int(employee_count)
+                    if isinstance(employee_count, int)
+                    or str(employee_count).isdigit()
+                    else None
+                )
+                records.append(
+                    StartupRecord(
+                        source=Source(name=self.source_name, url=source_url),
+                        collectedAt=collected,
+                        entityName=str(name),
+                        employeeCount=employee_count,
+                    )
+                )
             else:
                 pricing = item.get("pricing_model", item.get("pricingModel"))
-                pricing = pricing if pricing in {"FREE", "FREEMIUM", "PAID", "ENTERPRISE"} else None
-                records.append(ProductRecord(source=Source(name=self.source_name, url=source_url), collectedAt=collected, startupName=str(name), pricingModel=pricing))
+                pricing = (
+                    pricing
+                    if pricing in {"FREE", "FREEMIUM", "PAID", "ENTERPRISE"}
+                    else None
+                )
+                records.append(
+                    ProductRecord(
+                        source=Source(name=self.source_name, url=source_url),
+                        collectedAt=collected,
+                        startupName=str(name),
+                        pricingModel=pricing,
+                    )
+                )
         next_url = payload.get("next") if isinstance(payload, dict) else None
         return records, urljoin(page_url, next_url) if next_url else None
 
-    def _parse_json_ld(self, soup: BeautifulSoup, page_url: str, collected: datetime, seen_urls: set[str]) -> list[StartupRecord | ProductRecord]:
+    def _parse_json_ld(
+        self,
+        soup: BeautifulSoup,
+        page_url: str,
+        collected: datetime,
+        seen_urls: set[str],
+    ) -> list[StartupRecord | ProductRecord]:
         records: list[StartupRecord | ProductRecord] = []
         for script in soup.find_all("script", type="application/ld+json"):
             try:
                 payload = json.loads(script.string or script.get_text())
             except (TypeError, json.JSONDecodeError):
                 continue
-            objects = payload.get("itemListElement", []) if isinstance(payload, dict) and payload.get("@type") == "ItemList" else [payload]
+            objects = (
+                payload.get("itemListElement", [])
+                if isinstance(payload, dict) and payload.get("@type") == "ItemList"
+                else [payload]
+            )
             for entry in objects:
                 item = entry.get("item", entry) if isinstance(entry, dict) else {}
                 if not isinstance(item, dict):
@@ -215,12 +368,42 @@ class PublicDirectoryCrawler:
                     employee_count = item.get("numberOfEmployees")
                     if isinstance(employee_count, dict):
                         employee_count = employee_count.get("value")
-                    employee_count = int(employee_count) if isinstance(employee_count, int) or str(employee_count).isdigit() else None
-                    records.append(StartupRecord(source=Source(name=self.source_name, url=source_url), collectedAt=collected, entityName=str(name), employeeCount=employee_count))
+                    employee_count = (
+                        int(employee_count)
+                        if employee_count is not None
+                        and (
+                            isinstance(employee_count, int)
+                            or str(employee_count).isdigit()
+                        )
+                        else None
+                    )
+                    records.append(
+                        StartupRecord(
+                            source=Source(name=self.source_name, url=source_url),
+                            collectedAt=collected,
+                            entityName=str(name),
+                            employeeCount=employee_count,
+                        )
+                    )
                 elif item.get("@type") in {"Product", "SoftwareApplication"}:
-                    pricing = item.get("offers", {}).get("category") if isinstance(item.get("offers"), dict) else None
-                    pricing = pricing if pricing in {"FREE", "FREEMIUM", "PAID", "ENTERPRISE"} else None
-                    records.append(ProductRecord(source=Source(name=self.source_name, url=source_url), collectedAt=collected, startupName=str(name), pricingModel=pricing))
+                    pricing = (
+                        item.get("offers", {}).get("category")
+                        if isinstance(item.get("offers"), dict)
+                        else None
+                    )
+                    pricing = (
+                        pricing
+                        if pricing in {"FREE", "FREEMIUM", "PAID", "ENTERPRISE"}
+                        else None
+                    )
+                    records.append(
+                        ProductRecord(
+                            source=Source(name=self.source_name, url=source_url),
+                            collectedAt=collected,
+                            startupName=str(name),
+                            pricingModel=pricing,
+                        )
+                    )
         return records
 
 
@@ -230,26 +413,47 @@ class ProductHuntCrawler:
     public_directory = "https://www.producthunt.com/products"
     product_path = re.compile(r"^/products/([^/?#]+)$")
 
+    @staticmethod
+    def _get_token() -> str:
+        """Return the Product Hunt API token with leading/trailing whitespace stripped."""
+        return os.getenv("PRODUCT_HUNT_TOKEN", "").strip()
+
     async def crawl(self, limit: int = 1000) -> list[ProductRecord]:
-        token = os.getenv("PRODUCT_HUNT_TOKEN")
+        token = self._get_token()
         if not token:
-            raise RuntimeError("PRODUCT_HUNT_TOKEN is required for Product Hunt ingestion")
+            raise RuntimeError(
+                "PRODUCT_HUNT_TOKEN is required for Product Hunt ingestion"
+            )
         records: list[ProductRecord] = []
         seen: set[str] = set()
         after = None
         collected = datetime.now(timezone.utc)
         fetcher = AsyncFetcher()
-        async with aiohttp.ClientSession(timeout=fetcher.timeout, connector=fetcher.connector()) as session:
+        async with aiohttp.ClientSession(
+            timeout=fetcher.timeout, connector=fetcher.connector()
+        ) as session:
             while len(records) < limit:
-                async with session.post(self.endpoint, headers={"Authorization": f"Bearer {token}"}, json={"query": self.query, "variables": {"after": after}}) as response:
+                async with session.post(
+                    self.endpoint,
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"query": self.query, "variables": {"after": after}},
+                ) as response:
                     if response.status in {401, 403}:
-                        raise RuntimeError(f"Product Hunt API authentication failed (HTTP {response.status}). Rotate PRODUCT_HUNT_TOKEN and update .env.")
+                        raise RuntimeError(
+                            f"Product Hunt API authentication failed (HTTP {response.status}). "
+                            "Rotate PRODUCT_HUNT_TOKEN and update .env."
+                        )
                     if response.status == 429:
-                        raise RuntimeError("Product Hunt API rate limit reached. Retry later or use a valid token with sufficient quota.")
+                        raise RuntimeError(
+                            "Product Hunt API rate limit reached. "
+                            "Retry later or use a valid token with sufficient quota."
+                        )
                     response.raise_for_status()
                     payload = await response.json()
                 if payload.get("errors"):
-                    raise RuntimeError(f"Product Hunt API error: {payload['errors'][0].get('message', 'unknown error')}")
+                    raise RuntimeError(
+                        f"Product Hunt API error: {payload['errors'][0].get('message', 'unknown error')}"
+                    )
                 posts = payload.get("data", {}).get("posts", {})
                 for edge in posts.get("edges", []):
                     product = edge.get("node", {})
@@ -258,7 +462,22 @@ class ProductHuntCrawler:
                     if not url or not name or url in seen:
                         continue
                     seen.add(url)
-                    records.append(ProductRecord(source=Source(name="Product Hunt", url=url, record_id=str(product.get("id")) if product.get("id") else None), collectedAt=collected, startupName=name, pricingModel=None))
+                    records.append(
+                        ProductRecord(
+                            source=Source(
+                                name="Product Hunt",
+                                url=url,
+                                record_id=(
+                                    str(product.get("id"))
+                                    if product.get("id")
+                                    else None
+                                ),
+                            ),
+                            collectedAt=collected,
+                            startupName=name,
+                            pricingModel=None,
+                        )
+                    )
                     if len(records) >= limit:
                         break
                 page_info = posts.get("pageInfo", {})
@@ -275,20 +494,39 @@ class ProductHuntCrawler:
         records: list[ProductRecord] = []
         seen: set[str] = set()
         max_pages = max(1, int(os.getenv("PRODUCT_HUNT_MAX_PAGES", "30")))
-        page_concurrency = max(1, int(os.getenv("PRODUCT_HUNT_PAGE_CONCURRENCY", "5")))
+        page_concurrency = max(
+            1, int(os.getenv("PRODUCT_HUNT_PAGE_CONCURRENCY", "5"))
+        )
 
-        async def fetch_page(session: aiohttp.ClientSession, page_number: int) -> list[ProductRecord]:
-            page_url = self.public_directory if page_number == 1 else f"{self.public_directory}?page={page_number}"
-            return self._parse_public_page(await fetcher.get(session, page_url), collected)
+        async def fetch_page(
+            session: aiohttp.ClientSession, page_number: int
+        ) -> list[ProductRecord]:
+            page_url = (
+                self.public_directory
+                if page_number == 1
+                else f"{self.public_directory}?page={page_number}"
+            )
+            return self._parse_public_page(
+                await fetcher.get(session, page_url), collected
+            )
 
-        async with aiohttp.ClientSession(timeout=fetcher.timeout, connector=fetcher.connector()) as session:
+        async with aiohttp.ClientSession(
+            timeout=fetcher.timeout, connector=fetcher.connector()
+        ) as session:
             for first_page in range(1, max_pages + 1, page_concurrency):
-                page_numbers = range(first_page, min(first_page + page_concurrency, max_pages + 1))
-                pages = await asyncio.gather(*(fetch_page(session, page) for page in page_numbers), return_exceptions=True)
+                page_numbers = range(
+                    first_page, min(first_page + page_concurrency, max_pages + 1)
+                )
+                pages = await asyncio.gather(
+                    *(fetch_page(session, page) for page in page_numbers),
+                    return_exceptions=True,
+                )
                 successful_pages = 0
                 for page_records in pages:
-                    if isinstance(page_records, Exception):
-                        LOGGER.warning("product_hunt_public_page_failed error=%s", page_records)
+                    if isinstance(page_records, BaseException):
+                        LOGGER.warning(
+                            "product_hunt_public_page_failed error=%s", page_records
+                        )
                         continue
                     successful_pages += 1
                     for record in page_records:
@@ -304,7 +542,9 @@ class ProductHuntCrawler:
         return records
 
     @classmethod
-    def _parse_public_page(cls, html: str, collected: datetime) -> list[ProductRecord]:
+    def _parse_public_page(
+        cls, html: str, collected: datetime
+    ) -> list[ProductRecord]:
         """Parse only explicit Product Hunt product anchors with an explicit name."""
         records: list[ProductRecord] = []
         page_seen: set[str] = set()
@@ -319,14 +559,41 @@ class ProductHuntCrawler:
             if url in page_seen:
                 continue
             page_seen.add(url)
-            records.append(ProductRecord(source=Source(name="Product Hunt public directory", url=url), collectedAt=collected, startupName=name, pricingModel=None))
+            records.append(
+                ProductRecord(
+                    source=Source(name="Product Hunt public directory", url=url),
+                    collectedAt=collected,
+                    startupName=name,
+                    pricingModel=None,
+                )
+            )
         return records
 
 
 class GitHubProductCrawler:
-    """Collect explicit open-source AI software products from GitHub's public API."""
+    """Collect explicit open-source AI software products from GitHub's public API.
+
+    Uses multiple search topic queries to reliably reach the requested limit.
+    Each page returns up to 100 results; GitHub search caps each query at 1000
+    results (10 pages).  By cycling through several AI-related topics and
+    deduplicating by html_url, the crawler can collect well over 1,000 unique
+    repositories.
+    """
 
     endpoint = "https://api.github.com/search/repositories"
+    # Topics queried in order; cycling allows >1000 unique results.
+    _topics = [
+        "artificial-intelligence",
+        "machine-learning",
+        "deep-learning",
+        "natural-language-processing",
+        "computer-vision",
+        "large-language-model",
+        "generative-ai",
+        "llm",
+        "transformers",
+        "neural-network",
+    ]
 
     async def crawl(self, limit: int = 1000) -> list[ProductRecord]:
         if limit <= 0:
@@ -339,20 +606,63 @@ class GitHubProductCrawler:
         collected = datetime.now(timezone.utc)
         records: list[ProductRecord] = []
         seen: set[str] = set()
-        async with aiohttp.ClientSession(timeout=fetcher.timeout, headers=headers, connector=fetcher.connector()) as session:
-            for page in range(1, min(10, (limit + 99) // 100) + 1):
-                url = f"{self.endpoint}?q=topic%3Aartificial-intelligence&sort=updated&order=desc&per_page=100&page={page}"
-                payload = json.loads(await fetcher.get(session, url))
-                items = payload.get("items", []) if isinstance(payload, dict) else []
-                if not items:
+        pages_per_topic = 10  # GitHub search API caps at 1000 results per query
+        async with aiohttp.ClientSession(
+            timeout=fetcher.timeout, headers=headers, connector=fetcher.connector()
+        ) as session:
+            for topic in self._topics:
+                if len(records) >= limit:
                     break
-                for item in items:
-                    name = item.get("full_name") or item.get("name")
-                    source_url = item.get("html_url")
-                    if not name or not source_url or source_url in seen:
-                        continue
-                    seen.add(source_url)
-                    records.append(ProductRecord(source=Source(name="GitHub AI software repository", url=source_url, record_id=str(item.get("id")) if item.get("id") else None), collectedAt=collected, startupName=str(name), pricingModel=None))
+                for page in range(1, pages_per_topic + 1):
                     if len(records) >= limit:
-                        return records
+                        break
+                    url = (
+                        f"{self.endpoint}?q=topic%3A{topic}"
+                        f"&sort=updated&order=desc&per_page=100&page={page}"
+                    )
+                    try:
+                        payload = json.loads(await fetcher.get(session, url))
+                    except (
+                        aiohttp.ClientError,
+                        asyncio.TimeoutError,
+                        json.JSONDecodeError,
+                    ) as error:
+                        LOGGER.warning(
+                            "github_product_page_failed topic=%s page=%s error=%s",
+                            topic,
+                            page,
+                            error,
+                        )
+                        break
+                    items = (
+                        payload.get("items", [])
+                        if isinstance(payload, dict)
+                        else []
+                    )
+                    if not items:
+                        break
+                    for item in items:
+                        name = item.get("full_name") or item.get("name")
+                        source_url = item.get("html_url")
+                        if not name or not source_url or source_url in seen:
+                            continue
+                        seen.add(source_url)
+                        records.append(
+                            ProductRecord(
+                                source=Source(
+                                    name="GitHub AI software repository",
+                                    url=source_url,
+                                    record_id=(
+                                        str(item.get("id"))
+                                        if item.get("id")
+                                        else None
+                                    ),
+                                ),
+                                collectedAt=collected,
+                                startupName=str(name),
+                                pricingModel=None,
+                            )
+                        )
+                        if len(records) >= limit:
+                            return records
         return records
